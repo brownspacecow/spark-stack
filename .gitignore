@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+!.env.nemotron.example
+
+litellm-key.txt
+litellm-config.qwen-backup.yaml
+
+mnt/
+*.log

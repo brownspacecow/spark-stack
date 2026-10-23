@@ -1,0 +1,143 @@
+# DGX Spark inference stack: vLLM -> LiteLLM gateway -> Prometheus -> Grafana
+# Usage: cp .env.example .env && edit it, then: docker compose up -d
+name: spark-stack
+
+services:
+  vllm:
+    image: ${VLLM_IMAGE}
+    entrypoint: ["vllm", "serve"]
+    command:
+      - ${MODEL}
+      - --served-model-name
+      - ${SERVED_NAME:-local}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --gpu-memory-utilization
+      - ${GPU_MEM_UTIL:-0.65}
+      - --max-model-len
+      - ${MAX_MODEL_LEN:-32768}
+      - --max-num-seqs
+      - ${MAX_NUM_SEQS:-4}
+      - --max-num-batched-tokens
+      - "8192"
+      - --trust-remote-code
+      - --speculative_config.model
+      - ${DRAFT_MODEL}
+      - --speculative_config.num_speculative_tokens
+      - "7"
+      - --speculative_config.method
+      - dflash
+      - --mamba-backend
+      - flashinfer
+      - --mamba-ssm-cache-dtype
+      - float16
+      - --enable-mamba-cache-stochastic-rounding
+      - --mamba-cache-philox-rounds
+      - "5"
+      - --enable-mamba-shared-prefix-checkpoint
+      - --video-pruning-rate
+      - "0.5"
+      - --media-io-kwargs
+      - '{"video":{"fps":2,"num_frames":256}}'
+      - --block-size
+      - "64"
+      - --prefix-match-unit
+      - "64"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - ${TOOL_PARSER:-qwen3_coder}
+      - --reasoning-parser
+      - ${REASONING_PARSER:-qwen3}
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ${HF_CACHE:-/home/${USER}/.cache/huggingface}:/root/.cache/huggingface
+      - vllmcache:/root/.cache/vllm
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    # Not published to the host; only reachable by other containers on this network.
+    # First start downloads the model and can take a long while.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 40
+      start_period: 600s
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?set PG_PASSWORD in .env}
+      POSTGRES_DB: litellm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY (must start with sk-)}
+      DATABASE_URL: postgresql://litellm:${PG_PASSWORD}@postgres:5432/litellm
+      SERVED_NAME: ${SERVED_NAME:-local}
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    ports:
+      - "4000:4000"   # the one endpoint your apps (Open WebUI, scripts) talk to
+    depends_on:
+      - postgres
+      - vllm
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2y   # long retention so savings history sticks around
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./litellm-key.txt:/etc/prometheus/litellm-key.txt:ro
+      - promdata:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    command:
+      - --collector.disable-defaults   # a default collector hangs on this machine; keep only what the dashboard uses
+      - --collector.meminfo
+      - --collector.cpu
+      - --collector.loadavg
+    pid: host
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  vllmcache:
+  pgdata:
+  promdata:
+  grafanadata:
