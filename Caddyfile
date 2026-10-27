@@ -1,0 +1,55 @@
+# Route allowlist between cloudflared and LiteLLM.
+# Anything not matched below returns 404 and never reaches LiteLLM.
+#
+# Validate after editing:
+#   docker run --rm -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2-alpine \
+#     caddy validate --config /etc/caddy/Caddyfile
+# Reload without downtime:
+#   docker compose exec edge-proxy caddy reload --config /etc/caddy/Caddyfile
+# (admin API is off, so a restart is the fallback: docker compose restart edge-proxy)
+
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	# Access log for auditing. Secret-bearing headers are scrubbed. Caddy already
+	# redacts Authorization; x-api-key / api-key (Anthropic- and Azure-style clients)
+	# are NOT redacted by default, so they are removed here.
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers>X-Api-Key delete
+				request>headers>Api-Key delete
+				request>headers>Cf-Access-Client-Secret delete
+			}
+		}
+	}
+
+	# Inference routes only. Each works with or without the /v1 prefix, because
+	# different clients are configured differently.
+	#   chat/completions, completions   OpenAI chat + legacy completions
+	#   embeddings                      OpenAI embeddings
+	#   responses                       OpenAI Responses API
+	#   messages, messages/count_tokens Anthropic-style (e.g. Claude Code-type clients)
+	#   models, models/{id}             model discovery (most clients call this first)
+	# The id segments must start with an alphanumeric, so ".." can't slip through.
+	@llm path_regexp llm ^/(v1/)?(chat/completions|completions|embeddings|messages(/count_tokens)?|models(/[A-Za-z0-9][A-Za-z0-9._:-]*)?|responses(/[A-Za-z0-9][A-Za-z0-9._:-]*)?)$
+
+	handle @llm {
+		# Reject oversized bodies at the edge (long chats / base64 images need headroom).
+		request_body {
+			max_size 25MB
+		}
+		reverse_proxy litellm:4000 {
+			flush_interval -1   # stream SSE tokens immediately
+		}
+	}
+
+	handle {
+		respond "Not found" 404
+	}
+}

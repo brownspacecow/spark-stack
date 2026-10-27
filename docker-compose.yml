@@ -1,6 +1,21 @@
-# DGX Spark inference stack: vLLM -> LiteLLM gateway -> Prometheus -> Grafana
+# DGX Spark inference stack, hardened for internet exposure via Cloudflare Tunnel.
+#
+#   Internet -> Cloudflare -> cloudflared -> edge-proxy (Caddy path allowlist) -> litellm -> vllm
+#                                                                                     |-> postgres
+#   prometheus / grafana / node-exporter stay on the backend network (never tunneled)
+#
+# Networks (a container can only talk to peers it shares a network with):
+#   tunnel   : cloudflared <-> edge-proxy            (cloudflared can reach NOTHING else)
+#   gateway  : edge-proxy  <-> litellm               (edge-proxy can reach only litellm)
+#   backend  : litellm, vllm, postgres, prometheus, grafana, node-exporter
+#
 # Usage: cp .env.example .env && edit it, then: docker compose up -d
+
 name: spark-stack
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
 
 services:
   vllm:
@@ -50,6 +65,12 @@ services:
       - ${TOOL_PARSER:-qwen3_coder}
       - --reasoning-parser
       - ${REASONING_PARSER:-qwen3}
+      # SSRF protection: vLLM fetches image_url / video URLs server-side, so any
+      # authenticated client can make it request arbitrary URLs (LAN, metadata, etc.).
+      # Uncomment once you've confirmed your vLLM version supports the flag
+      # (`vllm serve --help | grep allowed-media`), and set ALLOWED_MEDIA_DOMAINS in .env.
+      # - --allowed-media-domains
+      # - ${ALLOWED_MEDIA_DOMAINS}
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
     volumes:
@@ -63,8 +84,9 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    networks: [backend]
     restart: unless-stopped
-    # Not published to the host; only reachable by other containers on this network.
+    # Not published to the host; only reachable by litellm over the backend network.
     # First start downloads the model and can take a long while.
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
@@ -81,60 +103,118 @@ services:
       POSTGRES_DB: litellm
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks: [backend]
     restart: unless-stopped
 
   litellm:
-    image: ghcr.io/berriai/litellm:main-stable
+    # Pin this in .env (LITELLM_IMAGE) to a specific release tag or digest.
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-stable}
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY (must start with sk-)}
+      # Encrypts provider credentials stored in the DB. Set once; changing it later
+      # breaks anything already stored. Generate: echo "sk-$(openssl rand -hex 32)"
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?set LITELLM_SALT_KEY in .env}
       DATABASE_URL: postgresql://litellm:${PG_PASSWORD}@postgres:5432/litellm
       SERVED_NAME: ${SERVED_NAME:-local}
+      NO_DOCS: "True"     # disable /docs (Swagger)
+      NO_REDOC: "True"    # disable /redoc
     volumes:
       - ./litellm-config.yaml:/app/config.yaml:ro
+    # Local/LAN access for your own tools, key management, and testing. Bound to
+    # loopback by default. Set LITELLM_BIND to the Spark's LAN IP if other machines
+    # on your network need direct access. NEVER use 0.0.0.0 here: published ports
+    # bypass ufw. Internet traffic does NOT use this port; it arrives via the tunnel.
     ports:
-      - "4000:4000"   # the one endpoint your apps (Open WebUI, scripts) talk to
+      - "${LITELLM_BIND:-127.0.0.1}:4000:4000"
+    networks: [gateway, backend]
     depends_on:
       - postgres
       - vllm
     restart: unless-stopped
 
+  # Path allowlist in front of LiteLLM. Only inference routes are forwarded; /ui,
+  # /key/*, /user/*, /team/*, /model/*, /config/*, /spend/*, /metrics, /health, etc.
+  # return 404 to the internet. Edit ./Caddyfile to add routes as you test clients.
+  edge-proxy:
+    image: ${CADDY_IMAGE:-caddy:2-alpine}
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]   # the caddy binary carries this file capability; dropping it breaks exec
+    read_only: true
+    tmpfs:
+      - /data
+      - /config
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    networks: [tunnel, gateway]
+    depends_on:
+      - litellm
+    restart: unless-stopped
+
+  # Outbound-only tunnel to Cloudflare. No inbound ports are opened on the Spark.
+  # In the Zero Trust dashboard, set the public hostname's service to:
+  #   http://edge-proxy:8080
+  cloudflared:
+    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}
+    <<: *hardening
+    read_only: true
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:?set CF_TUNNEL_TOKEN in .env}
+    networks: [tunnel]
+    depends_on:
+      - edge-proxy
+    restart: unless-stopped
+
   prometheus:
-    image: prom/prometheus:latest
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:latest}
     command:
       - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.retention.time=2y   # long retention so savings history sticks around
+      - --storage.tsdb.retention.time=2y # long retention so savings history sticks around
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./litellm-key.txt:/etc/prometheus/litellm-key.txt:ro
       - promdata:/prometheus
     ports:
       - "127.0.0.1:9090:9090"
+    networks: [backend]
     restart: unless-stopped
 
   node-exporter:
-    image: prom/node-exporter:latest
+    image: ${NODE_EXPORTER_IMAGE:-prom/node-exporter:latest}
     command:
-      - --collector.disable-defaults   # a default collector hangs on this machine; keep only what the dashboard uses
+      - --collector.disable-defaults # a default collector hangs on this machine; keep only what the dashboard uses
       - --collector.meminfo
       - --collector.cpu
       - --collector.loadavg
     pid: host
+    networks: [backend]
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:latest
+    image: ${GRAFANA_IMAGE:-grafana/grafana:latest}
     environment:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
     volumes:
       - grafanadata:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    # Loopback by default. Set GRAFANA_BIND to the LAN IP for LAN access.
+    # Do not add a tunnel hostname for Grafana unless it sits behind Cloudflare Access.
     ports:
-      - "3000:3000"
+      - "${GRAFANA_BIND:-127.0.0.1}:3000:3000"
+    networks: [backend]
     depends_on:
       - prometheus
     restart: unless-stopped
+
+networks:
+  tunnel: {}
+  gateway: {}
+  backend: {}
 
 volumes:
   vllmcache:
